@@ -45,13 +45,13 @@ const (
 type DiscoveryPacket struct {
 	Magic     [4]byte
 	ClientID  [16]byte
-	PublicKey [33]byte
+	PublicKey [65]byte
 	Timestamp int64
 }
 
 type HandshakeResponse struct {
 	SessionID [16]byte
-	PublicKey [33]byte
+	PublicKey [65]byte
 	DTLSPort  uint16
 }
 
@@ -156,8 +156,8 @@ func NewRelayServer() (*RelayServer, error) {
 	publicKeyBytes := privateKey.PublicKey().Bytes()
 	log.Printf("Server public key format: length=%d, prefix=%02x", len(publicKeyBytes), publicKeyBytes[0])
 
-	if len(publicKeyBytes) != 33 || (publicKeyBytes[0] != 0x02 && publicKeyBytes[0] != 0x03) {
-		return nil, fmt.Errorf("Unexpected public key format: expected 33 bytes with 0x02/0x03 prefix, got %d bytes with %02x prefix",
+	if len(publicKeyBytes) != 65 || publicKeyBytes[0] != 0x04 { // ИЗМЕНЕНО: проверяем 65 байт и префикс 0x04
+		return nil, fmt.Errorf("Unexpected public key format: expected 65 bytes with 0x04 prefix, got %d bytes with %02x prefix",
 			len(publicKeyBytes), publicKeyBytes[0])
 	}
 
@@ -337,7 +337,7 @@ func (s *RelayServer) handleMulticastMessages() {
 			continue
 		}
 
-		if n < 56 { // Минимальный размер DiscoveryPacket
+		if n < 88 { // Минимальный размер DiscoveryPacket
 			continue
 		}
 
@@ -354,7 +354,7 @@ func (s *RelayServer) handleMulticastMessages() {
 
 // Парсинг discovery пакета
 func (s *RelayServer) parseDiscoveryPacket(data []byte, packet *DiscoveryPacket) error {
-	if len(data) < 61 { // Изменено с 56 на 61
+	if len(data) < 93 { // ИЗМЕНЕНО: с 61 на 93 (4 + 16 + 65 + 8 = 93)
 		return fmt.Errorf("Packet too short")
 	}
 
@@ -364,8 +364,8 @@ func (s *RelayServer) parseDiscoveryPacket(data []byte, packet *DiscoveryPacket)
 	}
 
 	copy(packet.ClientID[:], data[4:20])
-	copy(packet.PublicKey[:], data[20:53]) // Изменено диапазон
-	packet.Timestamp = int64(binary.LittleEndian.Uint64(data[53:61]))
+	copy(packet.PublicKey[:], data[20:85])                            // ИЗМЕНЕНО: с data[20:53] на data[20:85]
+	packet.Timestamp = int64(binary.LittleEndian.Uint64(data[85:93])) // ИЗМЕНЕНО: с data[53:61] на data[85:93]
 
 	// Проверка timestamp (не старше 30 секунд)
 	now := time.Now().Unix()
@@ -447,25 +447,25 @@ func (s *RelayServer) sendHandshakeResponse(session *ClientSession, clientAddr *
 		DTLSPort:  8889,
 	}
 
-	// Получаем публичный ключ сервера в compressed формате
+	// Получаем публичный ключ сервера в uncompressed формате
 	serverPubBytes := s.publicKey.Bytes()
 
-	if len(serverPubBytes) == 33 {
-		// Уже в compressed формате
+	if len(serverPubBytes) == 65 { // ИЗМЕНЕНО: с 33 на 65
+		// Уже в uncompressed формате
 		copy(response.PublicKey[:], serverPubBytes)
 	} else {
-		// Если не compressed формат - ошибка конфигурации
+		// Если не uncompressed формат - ошибка конфигурации
 		s.log(fmt.Sprintf("Server key: unexpected format, length %d", len(serverPubBytes)))
 		return
 	}
 
-	s.log(fmt.Sprintf("Server compressed key: %x", response.PublicKey[:8]))
+	s.log(fmt.Sprintf("Server uncompressed key: %x", response.PublicKey[:8])) // ИЗМЕНЕНО: compressed на uncompressed
 
-	// Сериализуем ответ - теперь 51 байт (16 + 33 + 2)
-	data := make([]byte, 51)
+	// Сериализуем ответ - теперь 83 байта (16 + 65 + 2)  // ИЗМЕНЕНО: с 51 на 83
+	data := make([]byte, 83) // ИЗМЕНЕНО: с 51 на 83
 	copy(data[0:16], response.SessionID[:])
-	copy(data[16:49], response.PublicKey[:])
-	binary.LittleEndian.PutUint16(data[49:51], response.DTLSPort)
+	copy(data[16:81], response.PublicKey[:])                      // ИЗМЕНЕНО: с data[16:49] на data[16:81]
+	binary.LittleEndian.PutUint16(data[81:83], response.DTLSPort) // ИЗМЕНЕНО: с data[49:51] на data[81:83]
 
 	// Отправляем прямо на адрес клиента
 	conn, err := net.DialUDP("udp", nil, clientAddr)
