@@ -1413,7 +1413,7 @@ func (s *RelayServer) startServer() {
 func (s *RelayServer) stopServer() {
 	s.log("Stopping VPN Relay Server...")
 
-	// Сигнализируем о остановке
+	// Сигнализируем об остановке
 	select {
 	case <-s.stopChan:
 		// Уже закрыт
