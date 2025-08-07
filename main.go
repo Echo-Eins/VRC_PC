@@ -45,13 +45,13 @@ const (
 type DiscoveryPacket struct {
 	Magic     [4]byte
 	ClientID  [16]byte
-	PublicKey [32]byte
+	PublicKey [33]byte
 	Timestamp int64
 }
 
 type HandshakeResponse struct {
 	SessionID [16]byte
-	PublicKey [32]byte
+	PublicKey [33]byte
 	DTLSPort  uint16
 }
 
@@ -150,6 +150,15 @@ func NewRelayServer() (*RelayServer, error) {
 	privateKey, err := curve.GenerateKey(rand.Reader)
 	if err != nil {
 		return nil, fmt.Errorf("Failed to generate ECDH key: %v", err)
+	}
+
+	// Проверяем формат публичного ключа
+	publicKeyBytes := privateKey.PublicKey().Bytes()
+	log.Printf("Server public key format: length=%d, prefix=%02x", len(publicKeyBytes), publicKeyBytes[0])
+
+	if len(publicKeyBytes) != 33 || (publicKeyBytes[0] != 0x02 && publicKeyBytes[0] != 0x03) {
+		return nil, fmt.Errorf("Unexpected public key format: expected 33 bytes with 0x02/0x03 prefix, got %d bytes with %02x prefix",
+			len(publicKeyBytes), publicKeyBytes[0])
 	}
 
 	// Инициализируем DNS клиент
@@ -345,7 +354,7 @@ func (s *RelayServer) handleMulticastMessages() {
 
 // Парсинг discovery пакета
 func (s *RelayServer) parseDiscoveryPacket(data []byte, packet *DiscoveryPacket) error {
-	if len(data) < 56 {
+	if len(data) < 61 { // Изменено с 56 на 61
 		return fmt.Errorf("Packet too short")
 	}
 
@@ -355,8 +364,8 @@ func (s *RelayServer) parseDiscoveryPacket(data []byte, packet *DiscoveryPacket)
 	}
 
 	copy(packet.ClientID[:], data[4:20])
-	copy(packet.PublicKey[:], data[20:52])
-	packet.Timestamp = int64(binary.LittleEndian.Uint64(data[52:60]))
+	copy(packet.PublicKey[:], data[20:53]) // Изменено диапазон
+	packet.Timestamp = int64(binary.LittleEndian.Uint64(data[53:61]))
 
 	// Проверка timestamp (не старше 30 секунд)
 	now := time.Now().Unix()
@@ -374,23 +383,12 @@ func (s *RelayServer) handleDiscoveryPacket(packet *DiscoveryPacket, clientAddr 
 
 	s.log(fmt.Sprintf("Processing discovery packet from client %x at %v", packet.ClientID, clientAddr))
 
-	// Восстанавливаем публичный ключ клиента из X-координаты (32 байта)
-	// ECDH P256 точка может быть восстановлена из X-координаты в compressed формате
-	clientPubKeyBytes := make([]byte, 33)
-	clientPubKeyBytes[0] = 0x02 // compressed формат с четной Y координатой
-	copy(clientPubKeyBytes[1:], packet.PublicKey[:])
-
-	clientPublicKey, err := ecdh.P256().NewPublicKey(clientPubKeyBytes)
+	// Теперь у нас полный compressed публичный ключ
+	clientPublicKey, err := ecdh.P256().NewPublicKey(packet.PublicKey[:])
 	if err != nil {
-		// Попробуем с нечетной Y координатой
-		s.log("Trying compressed format with odd Y coordinate...")
-		clientPubKeyBytes[0] = 0x03 // compressed формат с нечетной Y координатой
-		clientPublicKey, err = ecdh.P256().NewPublicKey(clientPubKeyBytes)
-		if err != nil {
-			s.log(fmt.Sprintf("Failed to parse client public key with both Y coordinate variants: %v", err))
-			s.log(fmt.Sprintf("Client key bytes: %x", packet.PublicKey[:]))
-			return
-		}
+		s.log(fmt.Sprintf("Failed to parse client public key: %v", err))
+		s.log(fmt.Sprintf("Client key bytes: %x", packet.PublicKey[:]))
+		return
 	}
 
 	s.log("Successfully parsed client public key")
@@ -411,7 +409,6 @@ func (s *RelayServer) handleDiscoveryPacket(packet *DiscoveryPacket, clientAddr 
 	session.SharedKey = hasher.Sum(nil)
 
 	s.log(fmt.Sprintf("Combined key generated, length: %d bytes", len(session.SharedKey)))
-	s.log(fmt.Sprintf("Using PSK: %s", SHARED_SECRET))
 
 	// Отправляем handshake ответ клиенту
 	s.sendHandshakeResponse(session, clientAddr)
@@ -447,39 +444,28 @@ func (s *RelayServer) sendHandshakeResponse(session *ClientSession, clientAddr *
 	// Подготавливаем ответ
 	response := HandshakeResponse{
 		SessionID: session.ID,
-		DTLSPort:  8889, // Фиксированный порт для DTLS
+		DTLSPort:  8889,
 	}
 
-	// Получаем публичный ключ сервера и извлекаем X-координату
+	// Получаем публичный ключ сервера в compressed формате
 	serverPubBytes := s.publicKey.Bytes()
-	s.log(fmt.Sprintf("Server public key raw length: %d bytes", len(serverPubBytes)))
 
-	// Извлекаем только X-координату (32 байта) из публичного ключа
-	if len(serverPubBytes) == 33 && (serverPubBytes[0] == 0x02 || serverPubBytes[0] == 0x03) {
-		// Compressed формат: префикс (1 байт) + X координата (32 байта)
-		copy(response.PublicKey[:], serverPubBytes[1:33])
-		s.log("Server key: extracted X coordinate from compressed format")
-	} else if len(serverPubBytes) == 65 && serverPubBytes[0] == 0x04 {
-		// Uncompressed формат: префикс (1 байт) + X координата (32 байта) + Y координата (32 байта)
-		copy(response.PublicKey[:], serverPubBytes[1:33])
-		s.log("Server key: extracted X coordinate from uncompressed format")
+	if len(serverPubBytes) == 33 {
+		// Уже в compressed формате
+		copy(response.PublicKey[:], serverPubBytes)
 	} else {
-		// Неожиданный формат, используем как есть
-		s.log(fmt.Sprintf("Server key: unexpected format, length %d, prefix %02x", len(serverPubBytes), serverPubBytes[0]))
-		if len(serverPubBytes) >= 32 {
-			copy(response.PublicKey[:], serverPubBytes[:32])
-		} else {
-			copy(response.PublicKey[:len(serverPubBytes)], serverPubBytes)
-		}
+		// Если не compressed формат - ошибка конфигурации
+		s.log(fmt.Sprintf("Server key: unexpected format, length %d", len(serverPubBytes)))
+		return
 	}
 
-	s.log(fmt.Sprintf("Server X coordinate: %x", response.PublicKey[:8])) // Логируем первые 8 байт для отладки
+	s.log(fmt.Sprintf("Server compressed key: %x", response.PublicKey[:8]))
 
-	// Сериализуем ответ
-	data := make([]byte, 50) // 16 + 32 + 2
+	// Сериализуем ответ - теперь 51 байт (16 + 33 + 2)
+	data := make([]byte, 51)
 	copy(data[0:16], response.SessionID[:])
-	copy(data[16:48], response.PublicKey[:])
-	binary.LittleEndian.PutUint16(data[48:50], response.DTLSPort)
+	copy(data[16:49], response.PublicKey[:])
+	binary.LittleEndian.PutUint16(data[49:51], response.DTLSPort)
 
 	// Отправляем прямо на адрес клиента
 	conn, err := net.DialUDP("udp", nil, clientAddr)
@@ -495,8 +481,7 @@ func (s *RelayServer) sendHandshakeResponse(session *ClientSession, clientAddr *
 		return
 	}
 
-	s.log(fmt.Sprintf("Handshake response sent to %v (session ID: %x)", clientAddr, response.SessionID[:8]))
-	s.log(fmt.Sprintf("DTLS server available on port %d", response.DTLSPort))
+	s.log(fmt.Sprintf("Handshake response sent to %v", clientAddr))
 }
 
 // Запуск DTLS сервера
