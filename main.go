@@ -24,7 +24,7 @@ import (
 const (
 	MULTICAST_ADDR = "224.0.0.251:8888"
 	MAGIC_BYTES    = "VPNR"
-	SHARED_SECRET  = "your-shared-secret-here" // В продакшене из конфига
+	SHARED_SECRET  = "2108" // В продакшене из конфига
 
 	// Типы пакетов
 	PACKET_HTTP     = 1
@@ -149,7 +149,7 @@ func NewRelayServer() (*RelayServer, error) {
 	curve := ecdh.P256()
 	privateKey, err := curve.GenerateKey(rand.Reader)
 	if err != nil {
-		return nil, fmt.Errorf("failed to generate ECDH key: %v", err)
+		return nil, fmt.Errorf("Failed to generate ECDH key: %v", err)
 	}
 
 	// Инициализируем DNS клиент
@@ -292,12 +292,12 @@ func (session *ClientSession) cleanup() {
 func (s *RelayServer) startMulticastListener() error {
 	addr, err := net.ResolveUDPAddr("udp", MULTICAST_ADDR)
 	if err != nil {
-		return fmt.Errorf("failed to resolve multicast address: %v", err)
+		return fmt.Errorf("Failed to resolve multicast address: %v", err)
 	}
 
 	conn, err := net.ListenMulticastUDP("udp", nil, addr)
 	if err != nil {
-		return fmt.Errorf("failed to listen multicast: %v", err)
+		return fmt.Errorf("Failed to listen multicast: %v", err)
 	}
 
 	s.multicastConn = conn
@@ -346,12 +346,12 @@ func (s *RelayServer) handleMulticastMessages() {
 // Парсинг discovery пакета
 func (s *RelayServer) parseDiscoveryPacket(data []byte, packet *DiscoveryPacket) error {
 	if len(data) < 56 {
-		return fmt.Errorf("packet too short")
+		return fmt.Errorf("Packet too short")
 	}
 
 	copy(packet.Magic[:], data[0:4])
 	if string(packet.Magic[:]) != MAGIC_BYTES {
-		return fmt.Errorf("invalid magic bytes")
+		return fmt.Errorf("Invalid magic bytes")
 	}
 
 	copy(packet.ClientID[:], data[4:20])
@@ -361,7 +361,7 @@ func (s *RelayServer) parseDiscoveryPacket(data []byte, packet *DiscoveryPacket)
 	// Проверка timestamp (не старше 30 секунд)
 	now := time.Now().Unix()
 	if abs(now-packet.Timestamp) > 30 {
-		return fmt.Errorf("timestamp too old")
+		return fmt.Errorf("Timestamp too old")
 	}
 
 	return nil
@@ -372,26 +372,48 @@ func (s *RelayServer) handleDiscoveryPacket(packet *DiscoveryPacket, clientAddr 
 	// Создаем/обновляем сессию
 	session := s.getOrCreateSession(packet.ClientID, clientAddr)
 
-	// Вычисляем shared key через ECDH
-	clientPublicKey, err := ecdh.P256().NewPublicKey(packet.PublicKey[:])
+	s.log(fmt.Sprintf("Processing discovery packet from client %x at %v", packet.ClientID, clientAddr))
+
+	// Восстанавливаем публичный ключ клиента из X-координаты (32 байта)
+	// ECDH P256 точка может быть восстановлена из X-координаты в compressed формате
+	clientPubKeyBytes := make([]byte, 33)
+	clientPubKeyBytes[0] = 0x02 // compressed формат с четной Y координатой
+	copy(clientPubKeyBytes[1:], packet.PublicKey[:])
+
+	clientPublicKey, err := ecdh.P256().NewPublicKey(clientPubKeyBytes)
 	if err != nil {
-		s.log(fmt.Sprintf("Invalid client public key: %v", err))
-		return
+		// Попробуем с нечетной Y координатой
+		s.log("Trying compressed format with odd Y coordinate...")
+		clientPubKeyBytes[0] = 0x03 // compressed формат с нечетной Y координатой
+		clientPublicKey, err = ecdh.P256().NewPublicKey(clientPubKeyBytes)
+		if err != nil {
+			s.log(fmt.Sprintf("Failed to parse client public key with both Y coordinate variants: %v", err))
+			s.log(fmt.Sprintf("Client key bytes: %x", packet.PublicKey[:]))
+			return
+		}
 	}
 
+	s.log("Successfully parsed client public key")
+
+	// Выполняем ECDH для получения общего секрета
 	sharedSecret, err := s.privateKey.ECDH(clientPublicKey)
 	if err != nil {
-		s.log(fmt.Sprintf("ECDH failed: %v", err))
+		s.log(fmt.Sprintf("ECDH key exchange failed: %v", err))
 		return
 	}
 
-	// Комбинируем с общим секретом
+	s.log(fmt.Sprintf("ECDH successful, shared secret length: %d bytes", len(sharedSecret)))
+
+	// Комбинируем ECDH секрет с предварительно разделенным ключом (PSK)
 	hasher := sha256.New()
 	hasher.Write(sharedSecret)
 	hasher.Write([]byte(SHARED_SECRET))
 	session.SharedKey = hasher.Sum(nil)
 
-	// Отправляем ответ
+	s.log(fmt.Sprintf("Combined key generated, length: %d bytes", len(session.SharedKey)))
+	s.log(fmt.Sprintf("Using PSK: %s", SHARED_SECRET))
+
+	// Отправляем handshake ответ клиенту
 	s.sendHandshakeResponse(session, clientAddr)
 }
 
@@ -428,9 +450,30 @@ func (s *RelayServer) sendHandshakeResponse(session *ClientSession, clientAddr *
 		DTLSPort:  8889, // Фиксированный порт для DTLS
 	}
 
-	// Копируем публичный ключ сервера
+	// Получаем публичный ключ сервера и извлекаем X-координату
 	serverPubBytes := s.publicKey.Bytes()
-	copy(response.PublicKey[:], serverPubBytes)
+	s.log(fmt.Sprintf("Server public key raw length: %d bytes", len(serverPubBytes)))
+
+	// Извлекаем только X-координату (32 байта) из публичного ключа
+	if len(serverPubBytes) == 33 && (serverPubBytes[0] == 0x02 || serverPubBytes[0] == 0x03) {
+		// Compressed формат: префикс (1 байт) + X координата (32 байта)
+		copy(response.PublicKey[:], serverPubBytes[1:33])
+		s.log("Server key: extracted X coordinate from compressed format")
+	} else if len(serverPubBytes) == 65 && serverPubBytes[0] == 0x04 {
+		// Uncompressed формат: префикс (1 байт) + X координата (32 байта) + Y координата (32 байта)
+		copy(response.PublicKey[:], serverPubBytes[1:33])
+		s.log("Server key: extracted X coordinate from uncompressed format")
+	} else {
+		// Неожиданный формат, используем как есть
+		s.log(fmt.Sprintf("Server key: unexpected format, length %d, prefix %02x", len(serverPubBytes), serverPubBytes[0]))
+		if len(serverPubBytes) >= 32 {
+			copy(response.PublicKey[:], serverPubBytes[:32])
+		} else {
+			copy(response.PublicKey[:len(serverPubBytes)], serverPubBytes)
+		}
+	}
+
+	s.log(fmt.Sprintf("Server X coordinate: %x", response.PublicKey[:8])) // Логируем первые 8 байт для отладки
 
 	// Сериализуем ответ
 	data := make([]byte, 50) // 16 + 32 + 2
@@ -441,7 +484,7 @@ func (s *RelayServer) sendHandshakeResponse(session *ClientSession, clientAddr *
 	// Отправляем прямо на адрес клиента
 	conn, err := net.DialUDP("udp", nil, clientAddr)
 	if err != nil {
-		s.log(fmt.Sprintf("Failed to dial client: %v", err))
+		s.log(fmt.Sprintf("Failed to dial client for handshake response: %v", err))
 		return
 	}
 	defer conn.Close()
@@ -452,7 +495,8 @@ func (s *RelayServer) sendHandshakeResponse(session *ClientSession, clientAddr *
 		return
 	}
 
-	s.log(fmt.Sprintf("Handshake response sent to %v", clientAddr))
+	s.log(fmt.Sprintf("Handshake response sent to %v (session ID: %x)", clientAddr, response.SessionID[:8]))
+	s.log(fmt.Sprintf("DTLS server available on port %d", response.DTLSPort))
 }
 
 // Запуск DTLS сервера
@@ -468,12 +512,12 @@ func (s *RelayServer) startDTLSServer() error {
 
 	addr, err := net.ResolveUDPAddr("udp", ":8889")
 	if err != nil {
-		return fmt.Errorf("failed to resolve DTLS address: %v", err)
+		return fmt.Errorf("Failed to resolve DTLS address: %v", err)
 	}
 
 	listener, err := dtls.Listen("udp", addr, config)
 	if err != nil {
-		return fmt.Errorf("failed to start DTLS listener: %v", err)
+		return fmt.Errorf("Failed to start DTLS listener: %v", err)
 	}
 
 	s.dtlsListener = listener
