@@ -135,8 +135,9 @@ type RelayServer struct {
 	statsLabel  *widget.Label
 
 	// Каналы управления
-	stopChan chan struct{}
-	logChan  chan string
+	stopChan      chan struct{}
+	logChan       chan string
+	guiUpdateChan chan func() // НОВЫЙ канал для обновлений GUI
 
 	// Статистика
 	totalConnections uint64
@@ -174,15 +175,16 @@ func NewRelayServer() (*RelayServer, error) {
 	}
 
 	server := &RelayServer{
-		sessions:   make(map[[16]byte]*ClientSession),
-		privateKey: privateKey,
-		publicKey:  privateKey.PublicKey(),
-		stopChan:   make(chan struct{}),
-		logChan:    make(chan string, 1000),
-		dnsServers: dnsServers,
-		dnsCache:   make(map[string]*DNSCacheEntry),
-		dnsClient:  dnsClient,
-		startTime:  time.Now(),
+		sessions:      make(map[[16]byte]*ClientSession),
+		privateKey:    privateKey,
+		publicKey:     privateKey.PublicKey(),
+		stopChan:      make(chan struct{}),
+		logChan:       make(chan string, 1000),
+		guiUpdateChan: make(chan func(), 100), // НОВЫЙ канал
+		dnsServers:    dnsServers,
+		dnsCache:      make(map[string]*DNSCacheEntry),
+		dnsClient:     dnsClient,
+		startTime:     time.Now(),
 	}
 
 	// Запускаем cleanup горутину
@@ -677,26 +679,7 @@ func (s *RelayServer) handleClientConnection(conn *dtls.Conn) {
 	session := s.findSessionByDTLSConn(conn)
 	if session == nil {
 		s.log(fmt.Sprintf("❌ Could not find session for DTLS connection from %v", conn.RemoteAddr()))
-
-		// Попробуем найти по IP адресу
-		s.log("🔍 Searching sessions by IP address...")
-		s.sessionsMu.RLock()
-		for sessionID, sess := range s.sessions {
-			if sess.RemoteAddr != nil {
-				s.log(fmt.Sprintf("   Session %x: %v", sessionID[:4], sess.RemoteAddr))
-				if sess.RemoteAddr.IP.Equal(conn.RemoteAddr().(*net.UDPAddr).IP) {
-					s.log(fmt.Sprintf("✅ Found matching session by IP: %x", sessionID[:4]))
-					session = sess
-					break
-				}
-			}
-		}
-		s.sessionsMu.RUnlock()
-
-		if session == nil {
-			s.log("❌ No matching session found, closing connection")
-			return
-		}
+		return
 	} else {
 		s.log(fmt.Sprintf("✅ Found session: %x", session.ID[:4]))
 	}
@@ -731,11 +714,53 @@ func (s *RelayServer) handleClientConnection(conn *dtls.Conn) {
 
 	s.log("🔄 Starting main DTLS message loop...")
 
+	// ИСПРАВЛЕНИЕ: Запускаем горутину для периодической отправки keepalive
+	keepaliveStop := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-keepaliveStop:
+				return
+			case <-ticker.C:
+				// Отправляем keepalive пакет
+				keepaliveHeader := PacketHeader{
+					Type:      PACKET_RESPONSE,
+					ID:        0, // ID 0 для keepalive
+					Length:    4,
+					Timestamp: time.Now().Unix(),
+				}
+
+				packet := make([]byte, 24) // 20 байт заголовок + 4 байта данных
+				binary.LittleEndian.PutUint32(packet[0:4], keepaliveHeader.Type)
+				binary.LittleEndian.PutUint32(packet[4:8], keepaliveHeader.ID)
+				binary.LittleEndian.PutUint32(packet[8:12], keepaliveHeader.Length)
+				binary.LittleEndian.PutUint64(packet[12:20], uint64(keepaliveHeader.Timestamp))
+				copy(packet[20:24], []byte("KEEP"))
+
+				session.mu.Lock()
+				if session.DTLSConn != nil {
+					_, err := session.DTLSConn.Write(packet)
+					if err != nil {
+						s.log(fmt.Sprintf("❌ Keepalive send failed: %v", err))
+						session.mu.Unlock()
+						return
+					}
+					s.log("💓 Keepalive sent to client")
+				}
+				session.mu.Unlock()
+			}
+		}
+	}()
+	defer close(keepaliveStop)
+
 	buffer = make([]byte, MAX_PACKET_SIZE)
 
 	for {
 		// Читаем пакет с заголовком
-		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+		conn.SetReadDeadline(time.Now().Add(60 * time.Second)) // ИСПРАВЛЕНИЕ: Увеличиваем таймаут
 		n, err := conn.Read(buffer)
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
@@ -782,19 +807,35 @@ func (s *RelayServer) handleClientConnection(conn *dtls.Conn) {
 	}
 }
 
-// Поиск сессии по DTLS соединению - ОТЛАДОЧНАЯ ВЕРСИЯ
 func (s *RelayServer) findSessionByDTLSConn(conn *dtls.Conn) *ClientSession {
 	s.sessionsMu.RLock()
 	defer s.sessionsMu.RUnlock()
 
-	remoteAddr := conn.RemoteAddr().String()
+	remoteAddr := conn.RemoteAddr().(*net.UDPAddr)
 	s.log(fmt.Sprintf("🔍 Looking for session with remote address: %s", remoteAddr))
 	s.log(fmt.Sprintf("🔍 Available sessions: %d", len(s.sessions)))
 
+	// ИСПРАВЛЕНИЕ: Сначала пробуем точное совпадение
 	for sessionID, session := range s.sessions {
 		s.log(fmt.Sprintf("   Session %x: %v", sessionID[:4], session.RemoteAddr))
-		if session.RemoteAddr != nil && session.RemoteAddr.String() == remoteAddr {
-			s.log(fmt.Sprintf("✅ Found matching session: %x", sessionID[:4]))
+		if session.RemoteAddr != nil && session.RemoteAddr.String() == remoteAddr.String() {
+			s.log(fmt.Sprintf("✅ Found exact matching session: %x", sessionID[:4]))
+			return session
+		}
+	}
+
+	// ИСПРАВЛЕНИЕ: Если точного совпадения нет, ищем по IP (игнорируем порт)
+	s.log("🔍 Exact match not found, searching by IP only...")
+	for sessionID, session := range s.sessions {
+		if session.RemoteAddr != nil && session.RemoteAddr.IP.Equal(remoteAddr.IP) {
+			s.log(fmt.Sprintf("✅ Found matching session by IP: %x (port %d -> %d)",
+				sessionID[:4], session.RemoteAddr.Port, remoteAddr.Port))
+
+			// ВАЖНО: Обновляем порт в сессии для будущих сравнений
+			session.mu.Lock()
+			session.RemoteAddr.Port = remoteAddr.Port
+			session.mu.Unlock()
+
 			return session
 		}
 	}
@@ -1039,7 +1080,39 @@ func (s *RelayServer) handleDNSRequest(session *ClientSession, header *PacketHea
 	question := msg.Question[0]
 	s.log(fmt.Sprintf("DNS query for %s (type %d)", question.Name, question.Qtype))
 
-	// Проверяем кэш
+	// ИСПРАВЛЕНИЕ: Специальная обработка heartbeat запросов
+	if strings.Contains(strings.ToLower(question.Name), "heartbeat") {
+		s.log("💓 Heartbeat DNS query detected, sending synthetic response")
+
+		// Создаем синтетический ответ для heartbeat
+		response := new(dns.Msg)
+		response.SetReply(msg)
+		response.Authoritative = true
+		response.RecursionAvailable = true
+
+		// Добавляем фиктивный A-record для heartbeat
+		if question.Qtype == dns.TypeA {
+			rr := &dns.A{
+				Hdr: dns.RR_Header{
+					Name:   question.Name,
+					Rrtype: dns.TypeA,
+					Class:  dns.ClassINET,
+					Ttl:    60,
+				},
+				A: net.ParseIP("127.0.0.1"),
+			}
+			response.Answer = append(response.Answer, rr)
+		}
+
+		responseData, err := response.Pack()
+		if err == nil {
+			s.sendResponse(session, header.ID, PACKET_RESPONSE, responseData)
+			s.log("💓 Heartbeat response sent successfully")
+			return
+		}
+	}
+
+	// Проверяем кэш для обычных запросов
 	cacheKey := s.getDNSCacheKey(msg)
 	if cachedResponse := s.getDNSFromCache(cacheKey); cachedResponse != nil {
 		responseData, err := cachedResponse.Pack()
@@ -1375,7 +1448,6 @@ func (s *RelayServer) log(message string) {
 	log.Println(message)
 }
 
-// Создание GUI
 // Создание GUI - ИСПРАВЛЕННАЯ ВЕРСИЯ для сервера
 func (s *RelayServer) createGUI() fyne.Window {
 	myApp := app.New()
@@ -1386,22 +1458,22 @@ func (s *RelayServer) createGUI() fyne.Window {
 	s.statusLabel = widget.NewLabel("Server Status: Stopped")
 	s.statusLabel.TextStyle.Bold = true
 
-	// Кнопки управления
-	startButton := widget.NewButton("Start Server", func() {
-		// Отключаем кнопку сразу в UI thread
-		startButton.Disable()
+	// Сначала создаем кнопку без обработчика
+	startButton := widget.NewButton("Start Server", nil)
 
+	// Затем устанавливаем обработчик
+	startButton.OnTapped = func() {
+		startButton.Disable()
 		go func() {
 			defer func() {
-				// Включаем кнопку обратно через fyne.NewWithoutData
-				fyne.NewWithoutData(func() {
-					startButton.Enable()
-				}).Run()
+				select {
+				case s.guiUpdateChan <- func() { startButton.Enable() }:
+				default:
+				}
 			}()
-
 			s.startServer()
 		}()
-	})
+	}
 
 	stopButton := widget.NewButton("Stop Server", func() {
 		go func() {
@@ -1466,13 +1538,6 @@ func (s *RelayServer) createGUI() fyne.Window {
 		s.dnsServers = servers
 	}
 
-	// Кнопки дополнительного управления
-	clearLogsButton := widget.NewButton("Clear Logs", func() {
-		fyne.NewWithoutData(func() {
-			s.logText.SetText("Server log cleared...\n")
-		}).Run()
-	})
-
 	showStatsButton := widget.NewButton("Show Detailed Stats", func() {
 		go func() {
 			s.sessionsMu.RLock()
@@ -1535,7 +1600,6 @@ func (s *RelayServer) createGUI() fyne.Window {
 		startButton,
 		stopButton,
 		widget.NewSeparator(),
-		clearLogsButton,
 		showStatsButton,
 		clearCacheButton,
 	)
@@ -1588,7 +1652,7 @@ func (s *RelayServer) createGUI() fyne.Window {
 
 	myWindow.SetContent(content)
 
-	// ВАЖНО: Запускаем горутину обновления GUI
+	// ВАЖНО: Запускаем горутину обновления GUI с исправлениями
 	go s.updateGUI()
 
 	// Обработчик закрытия окна
@@ -1609,33 +1673,35 @@ func (s *RelayServer) updateGUI() {
 		select {
 		case <-s.stopChan:
 			return
+
 		case logMessage := <-s.logChan:
-			// ИСПРАВЛЕНИЕ: Обновление GUI через fyne.NewWithoutData
+			// ИСПРАВЛЕНИЕ: Прямое обновление в GUI потоке
 			if s.logText != nil {
-				fyne.NewWithoutData(func() {
-					currentText := s.logText.Text
-					newText := currentText + logMessage + "\n"
+				currentText := s.logText.Text
+				newText := currentText + logMessage + "\n"
 
-					// Ограничиваем размер лога
-					lines := strings.Split(newText, "\n")
-					if len(lines) > 1000 {
-						lines = lines[len(lines)-1000:]
-						newText = strings.Join(lines, "\n")
-					}
+				// Ограничиваем размер лога
+				lines := strings.Split(newText, "\n")
+				if len(lines) > 1000 {
+					lines = lines[len(lines)-1000:]
+					newText = strings.Join(lines, "\n")
+				}
 
-					s.logText.SetText(newText)
-					s.logText.CursorRow = len(lines) - 1
-				}).Run()
+				s.logText.SetText(newText)
+				s.logText.CursorRow = len(lines) - 1
 			}
+
+		case guiUpdate := <-s.guiUpdateChan:
+			// НОВЫЙ: Обработка обновлений GUI
+			if guiUpdate != nil {
+				guiUpdate()
+			}
+
 		case <-ticker.C:
-			// ИСПРАВЛЕНИЕ: Обновление статуса через fyne.NewWithoutData
-			if s.statusLabel != nil {
-				fyne.NewWithoutData(func() {
-					s.updateStats()
-					if s.clientsList != nil {
-						s.clientsList.Refresh()
-					}
-				}).Run()
+			// ИСПРАВЛЕНИЕ: Прямое обновление статуса
+			s.updateStats()
+			if s.clientsList != nil {
+				s.clientsList.Refresh()
 			}
 		}
 	}
@@ -1643,7 +1709,7 @@ func (s *RelayServer) updateGUI() {
 
 // Исправленный updateStats для сервера
 func (s *RelayServer) updateStats() {
-	// Эта функция теперь вызывается ТОЛЬКО из UI thread через fyne.NewWithoutData
+	// Эта функция вызывается из updateGUI, поэтому уже в правильном потоке
 	s.sessionsMu.RLock()
 	activeClients := len(s.sessions)
 
