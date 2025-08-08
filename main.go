@@ -299,80 +299,200 @@ func (session *ClientSession) cleanup() {
 
 // Запуск multicast listener
 func (s *RelayServer) startMulticastListener() error {
+	s.log("🚀 Starting multicast listener...")
+
 	addr, err := net.ResolveUDPAddr("udp", MULTICAST_ADDR)
 	if err != nil {
+		s.log(fmt.Sprintf("❌ Failed to resolve multicast address '%s': %v", MULTICAST_ADDR, err))
 		return fmt.Errorf("Failed to resolve multicast address: %v", err)
 	}
+	s.log(fmt.Sprintf("🌐 Multicast address resolved: %v", addr))
 
+	// ОТЛАДКА: Пробуем разные способы создания multicast listener
+	s.log("🔧 Attempting to create multicast UDP listener...")
+
+	// Способ 1: Стандартный multicast listener
 	conn, err := net.ListenMulticastUDP("udp", nil, addr)
 	if err != nil {
-		return fmt.Errorf("Failed to listen multicast: %v", err)
+		s.log(fmt.Sprintf("❌ Method 1 (ListenMulticastUDP) failed: %v", err))
+
+		// Способ 2: Обычный UDP listener на multicast адресе
+		s.log("🔧 Trying alternative method (ListenUDP)...")
+		conn, err = net.ListenUDP("udp", addr)
+		if err != nil {
+			s.log(fmt.Sprintf("❌ Method 2 (ListenUDP) also failed: %v", err))
+			return fmt.Errorf("Failed to listen multicast: %v", err)
+		}
+		s.log("✅ Alternative method (ListenUDP) succeeded!")
+	} else {
+		s.log("✅ Standard method (ListenMulticastUDP) succeeded!")
 	}
 
 	s.multicastConn = conn
-	s.log("Multicast listener started on " + MULTICAST_ADDR)
+
+	// Получаем информацию о созданном соединении
+	localAddr := conn.LocalAddr()
+	s.log(fmt.Sprintf("🔌 Multicast listener bound to: %v", localAddr))
+
+	s.log(fmt.Sprintf("✅ Multicast listener started on %s", MULTICAST_ADDR))
+	s.log("👂 Starting message handler goroutine...")
 
 	go s.handleMulticastMessages()
+
+	s.log("🎉 Multicast listener setup completed successfully!")
 	return nil
 }
 
-// Обработка multicast сообщений
+// Дополнительная функция для проверки сетевых интерфейсов
+func (s *RelayServer) checkNetworkInterfaces() {
+	s.log("🔍 Checking network interfaces...")
+
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		s.log(fmt.Sprintf("❌ Failed to get network interfaces: %v", err))
+		return
+	}
+
+	for _, iface := range interfaces {
+		if iface.Flags&net.FlagUp != 0 {
+			addrs, err := iface.Addrs()
+			if err != nil {
+				continue
+			}
+
+			s.log(fmt.Sprintf("🔌 Interface %s (%s):", iface.Name, iface.Flags.String()))
+			for _, addr := range addrs {
+				s.log(fmt.Sprintf("   📍 %s", addr.String()))
+			}
+		}
+	}
+}
+
+// Обработка multicast сообщений - ИСПРАВЛЕННАЯ ВЕРСИЯ
+// Обработка multicast сообщений - ОТЛАДОЧНАЯ ВЕРСИЯ с полным логированием
 func (s *RelayServer) handleMulticastMessages() {
 	buffer := make([]byte, 1024)
+	s.log("Starting multicast message handler...")
 
 	for {
 		select {
 		case <-s.stopChan:
+			s.log("Multicast handler stopping...")
 			return
 		default:
 		}
 
 		s.multicastConn.SetReadDeadline(time.Now().Add(time.Second))
 		n, clientAddr, err := s.multicastConn.ReadFromUDP(buffer)
+
+		// ОТЛАДКА: Логируем каждую попытку чтения
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				// Не логируем таймауты - они нормальные
 				continue
 			}
-			s.log(fmt.Sprintf("Multicast read error: %v", err))
+			s.log(fmt.Sprintf("❌ Multicast read error: %v", err))
 			continue
 		}
 
-		if n < 88 { // Минимальный размер DiscoveryPacket
+		// ОТЛАДКА: Логируем ВСЕ полученные пакеты
+		s.log(fmt.Sprintf("📦 RAW PACKET RECEIVED: %d bytes from %v", n, clientAddr))
+		s.log(fmt.Sprintf("📦 Raw data (first 32 bytes): %x", buffer[:min(n, 32)]))
+		s.log(fmt.Sprintf("📦 Raw data as string (first 16 bytes): %q", string(buffer[:min(n, 16)])))
+
+		// Проверяем минимальный размер
+		if n < 93 {
+			s.log(fmt.Sprintf("❌ Packet too short: %d bytes, expected at least 93", n))
+			s.log(fmt.Sprintf("❌ Full packet dump: %x", buffer[:n]))
 			continue
 		}
 
+		// ОТЛАДКА: Проверяем magic bytes вручную
+		receivedMagic := string(buffer[:4])
+		s.log(fmt.Sprintf("🔍 Magic bytes check: received='%s' (%x), expected='%s'",
+			receivedMagic, buffer[:4], MAGIC_BYTES))
+
+		if receivedMagic != MAGIC_BYTES {
+			s.log(fmt.Sprintf("❌ Magic bytes mismatch! Received: %q (%x), Expected: %q",
+				receivedMagic, buffer[:4], MAGIC_BYTES))
+			continue
+		}
+
+		// ОТЛАДКА: Показываем структуру пакета
+		s.log(fmt.Sprintf("🔍 Packet structure analysis:"))
+		s.log(fmt.Sprintf("   Magic (0-4): %x ('%s')", buffer[0:4], string(buffer[0:4])))
+		s.log(fmt.Sprintf("   ClientID (4-20): %x", buffer[4:20]))
+		s.log(fmt.Sprintf("   PublicKey (20-85): %x", buffer[20:min(40, n)])) // Показываем первые 20 байт ключа
+		if n >= 93 {
+			timestamp := int64(binary.LittleEndian.Uint64(buffer[85:93]))
+			s.log(fmt.Sprintf("   Timestamp (85-93): %d (%s)", timestamp, time.Unix(timestamp, 0)))
+		}
+
+		// Парсим пакет
 		var packet DiscoveryPacket
 		if err := s.parseDiscoveryPacket(buffer[:n], &packet); err != nil {
-			s.log(fmt.Sprintf("Invalid discovery packet from %v: %v", clientAddr, err))
+			s.log(fmt.Sprintf("❌ Invalid discovery packet from %v: %v", clientAddr, err))
+			s.log(fmt.Sprintf("❌ Failed packet full dump: %x", buffer[:n]))
 			continue
 		}
 
-		s.log(fmt.Sprintf("Discovery packet from %v", clientAddr))
+		s.log(fmt.Sprintf("✅ Valid discovery packet from %v (client %x)", clientAddr, packet.ClientID[:4]))
+		s.log(fmt.Sprintf("✅ Client public key: %x", packet.PublicKey[:8]))
+		s.log(fmt.Sprintf("✅ Timestamp: %d (%s)", packet.Timestamp, time.Unix(packet.Timestamp, 0)))
+
 		s.handleDiscoveryPacket(&packet, clientAddr)
 	}
 }
 
-// Парсинг discovery пакета
+// Вспомогательная функция min для безопасности
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// Улучшенный парсер с детальным логированием ошибок
 func (s *RelayServer) parseDiscoveryPacket(data []byte, packet *DiscoveryPacket) error {
-	if len(data) < 93 { // ИЗМЕНЕНО: с 61 на 93 (4 + 16 + 65 + 8 = 93)
-		return fmt.Errorf("Packet too short")
+	s.log(fmt.Sprintf("🔍 Parsing discovery packet: %d bytes", len(data)))
+
+	if len(data) < 93 {
+		return fmt.Errorf("packet too short: %d bytes, need 93", len(data))
 	}
 
+	// Парсим Magic
 	copy(packet.Magic[:], data[0:4])
-	if string(packet.Magic[:]) != MAGIC_BYTES {
-		return fmt.Errorf("Invalid magic bytes")
+	magicStr := string(packet.Magic[:])
+	s.log(fmt.Sprintf("🔍 Parsed magic: '%s'", magicStr))
+
+	if magicStr != MAGIC_BYTES {
+		return fmt.Errorf("invalid magic bytes: got '%s', expected '%s'", magicStr, MAGIC_BYTES)
 	}
 
+	// Парсим ClientID
 	copy(packet.ClientID[:], data[4:20])
-	copy(packet.PublicKey[:], data[20:85])                            // ИЗМЕНЕНО: с data[20:53] на data[20:85]
-	packet.Timestamp = int64(binary.LittleEndian.Uint64(data[85:93])) // ИЗМЕНЕНО: с data[53:61] на data[85:93]
+	s.log(fmt.Sprintf("🔍 Parsed ClientID: %x", packet.ClientID[:8]))
 
-	// Проверка timestamp (не старше 30 секунд)
+	// Парсим PublicKey
+	copy(packet.PublicKey[:], data[20:85])
+	s.log(fmt.Sprintf("🔍 Parsed PublicKey (first 8 bytes): %x", packet.PublicKey[:8]))
+	s.log(fmt.Sprintf("🔍 PublicKey format check: length=65, prefix=%02x", packet.PublicKey[0]))
+
+	// Парсим Timestamp
+	packet.Timestamp = int64(binary.LittleEndian.Uint64(data[85:93]))
+	s.log(fmt.Sprintf("🔍 Parsed Timestamp: %d (%s)", packet.Timestamp, time.Unix(packet.Timestamp, 0)))
+
+	// Проверка timestamp
 	now := time.Now().Unix()
-	if abs(now-packet.Timestamp) > 30 {
-		return fmt.Errorf("Timestamp too old")
+	timeDiff := abs(now - packet.Timestamp)
+	s.log(fmt.Sprintf("🔍 Timestamp validation: now=%d, packet=%d, diff=%d seconds",
+		now, packet.Timestamp, timeDiff))
+
+	if timeDiff > 30 {
+		return fmt.Errorf("timestamp too old: %d seconds difference (max 30)", timeDiff)
 	}
 
+	s.log(fmt.Sprintf("✅ Discovery packet parsed successfully"))
 	return nil
 }
 
@@ -439,7 +559,7 @@ func (s *RelayServer) getOrCreateSession(clientID [16]byte, addr *net.UDPAddr) *
 	return session
 }
 
-// Отправка handshake response
+// Отправка handshake response - ИСПРАВЛЕННАЯ ВЕРСИЯ с улучшенным логированием
 func (s *RelayServer) sendHandshakeResponse(session *ClientSession, clientAddr *net.UDPAddr) {
 	// Подготавливаем ответ
 	response := HandshakeResponse{
@@ -450,38 +570,47 @@ func (s *RelayServer) sendHandshakeResponse(session *ClientSession, clientAddr *
 	// Получаем публичный ключ сервера в uncompressed формате
 	serverPubBytes := s.publicKey.Bytes()
 
-	if len(serverPubBytes) == 65 { // ИЗМЕНЕНО: с 33 на 65
+	if len(serverPubBytes) == 65 && serverPubBytes[0] == 0x04 {
 		// Уже в uncompressed формате
 		copy(response.PublicKey[:], serverPubBytes)
+		s.log(fmt.Sprintf("Using server uncompressed public key: %x...", serverPubBytes[:8]))
 	} else {
-		// Если не uncompressed формат - ошибка конфигурации
-		s.log(fmt.Sprintf("Server key: unexpected format, length %d", len(serverPubBytes)))
+		s.log(fmt.Sprintf("ERROR: Server key unexpected format, length %d, prefix %02x",
+			len(serverPubBytes), serverPubBytes[0]))
 		return
 	}
 
-	s.log(fmt.Sprintf("Server uncompressed key: %x", response.PublicKey[:8])) // ИЗМЕНЕНО: compressed на uncompressed
-
-	// Сериализуем ответ - теперь 83 байта (16 + 65 + 2)  // ИЗМЕНЕНО: с 51 на 83
-	data := make([]byte, 83) // ИЗМЕНЕНО: с 51 на 83
+	// Сериализуем ответ - 83 байта (16 + 65 + 2)
+	data := make([]byte, 83)
 	copy(data[0:16], response.SessionID[:])
-	copy(data[16:81], response.PublicKey[:])                      // ИЗМЕНЕНО: с data[16:49] на data[16:81]
-	binary.LittleEndian.PutUint16(data[81:83], response.DTLSPort) // ИЗМЕНЕНО: с data[49:51] на data[81:83]
+	copy(data[16:81], response.PublicKey[:])
+	binary.LittleEndian.PutUint16(data[81:83], response.DTLSPort)
 
-	// Отправляем прямо на адрес клиента
+	s.log(fmt.Sprintf("Handshake response prepared: %d bytes, session %x, DTLS port %d",
+		len(data), response.SessionID[:4], response.DTLSPort))
+
+	// КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Отправляем прямо на адрес клиента
 	conn, err := net.DialUDP("udp", nil, clientAddr)
 	if err != nil {
-		s.log(fmt.Sprintf("Failed to dial client for handshake response: %v", err))
+		s.log(fmt.Sprintf("FAILED to dial client %v for handshake response: %v", clientAddr, err))
 		return
 	}
 	defer conn.Close()
 
-	_, err = conn.Write(data)
+	s.log(fmt.Sprintf("Sending handshake response to %v", clientAddr))
+
+	n, err := conn.Write(data)
 	if err != nil {
-		s.log(fmt.Sprintf("Failed to send handshake response: %v", err))
+		s.log(fmt.Sprintf("FAILED to send handshake response: %v", err))
 		return
 	}
 
-	s.log(fmt.Sprintf("Handshake response sent to %v", clientAddr))
+	if n != len(data) {
+		s.log(fmt.Sprintf("WARNING: Partial write: sent %d bytes, expected %d", n, len(data)))
+		return
+	}
+
+	s.log(fmt.Sprintf("SUCCESS: Handshake response sent to %v (%d bytes)", clientAddr, n))
 }
 
 // Запуск DTLS сервера
@@ -534,32 +663,93 @@ func (s *RelayServer) handleDTLSConnections() {
 	}
 }
 
-// Обработка соединения клиента
+// Обработка соединения клиента - ОТЛАДОЧНАЯ ВЕРСИЯ (сервер)
 func (s *RelayServer) handleClientConnection(conn *dtls.Conn) {
-	defer conn.Close()
+	defer func() {
+		s.log(fmt.Sprintf("🚪 Closing DTLS connection with %v", conn.RemoteAddr()))
+		conn.Close()
+	}()
+
+	s.log(fmt.Sprintf("🔗 New DTLS connection from %v", conn.RemoteAddr()))
+	s.log(fmt.Sprintf("🔍 Local DTLS address: %v", conn.LocalAddr()))
 
 	// Привязываем соединение к сессии
 	session := s.findSessionByDTLSConn(conn)
 	if session == nil {
-		s.log("Could not find session for DTLS connection")
-		return
+		s.log(fmt.Sprintf("❌ Could not find session for DTLS connection from %v", conn.RemoteAddr()))
+
+		// Попробуем найти по IP адресу
+		s.log("🔍 Searching sessions by IP address...")
+		s.sessionsMu.RLock()
+		for sessionID, sess := range s.sessions {
+			if sess.RemoteAddr != nil {
+				s.log(fmt.Sprintf("   Session %x: %v", sessionID[:4], sess.RemoteAddr))
+				if sess.RemoteAddr.IP.Equal(conn.RemoteAddr().(*net.UDPAddr).IP) {
+					s.log(fmt.Sprintf("✅ Found matching session by IP: %x", sessionID[:4]))
+					session = sess
+					break
+				}
+			}
+		}
+		s.sessionsMu.RUnlock()
+
+		if session == nil {
+			s.log("❌ No matching session found, closing connection")
+			return
+		}
+	} else {
+		s.log(fmt.Sprintf("✅ Found session: %x", session.ID[:4]))
 	}
 
 	session.mu.Lock()
 	session.DTLSConn = conn
 	session.mu.Unlock()
+	s.log("✅ DTLS connection bound to session")
 
-	buffer := make([]byte, MAX_PACKET_SIZE)
+	// Тестируем соединение
+	s.log("🧪 Testing DTLS connection...")
+	buffer := make([]byte, 1024)
+
+	// Устанавливаем короткий таймаут для первого чтения
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	n, err := conn.Read(buffer)
+
+	if err != nil {
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			s.log("⏰ No initial data from client (normal)")
+		} else {
+			s.log(fmt.Sprintf("❌ Initial read error: %v", err))
+			return
+		}
+	} else {
+		s.log(fmt.Sprintf("📨 Received initial data: %d bytes", n))
+		if string(buffer[:n]) == "PING" {
+			s.log("🏓 Received PING, sending PONG...")
+			conn.Write([]byte("PONG"))
+		}
+	}
+
+	s.log("🔄 Starting main DTLS message loop...")
+
+	buffer = make([]byte, MAX_PACKET_SIZE)
 
 	for {
 		// Читаем пакет с заголовком
+		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 		n, err := conn.Read(buffer)
 		if err != nil {
-			s.log(fmt.Sprintf("Client read error: %v", err))
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				s.log("⏰ Read timeout, continuing...")
+				continue
+			}
+			s.log(fmt.Sprintf("📡 Client read error: %v", err))
 			break
 		}
 
+		s.log(fmt.Sprintf("📦 Received packet: %d bytes", n))
+
 		if n < 20 { // Минимальный размер заголовка
+			s.log(fmt.Sprintf("⚠️ Packet too small: %d bytes", n))
 			continue
 		}
 
@@ -570,8 +760,11 @@ func (s *RelayServer) handleClientConnection(conn *dtls.Conn) {
 		header.Length = binary.LittleEndian.Uint32(buffer[8:12])
 		header.Timestamp = int64(binary.LittleEndian.Uint64(buffer[12:20]))
 
+		s.log(fmt.Sprintf("📋 Packet header: Type=%d, ID=%d, Length=%d",
+			header.Type, header.ID, header.Length))
+
 		if header.Length > MAX_PACKET_SIZE-20 {
-			s.log("Packet too large, ignoring")
+			s.log("❌ Packet too large, ignoring")
 			continue
 		}
 
@@ -589,17 +782,24 @@ func (s *RelayServer) handleClientConnection(conn *dtls.Conn) {
 	}
 }
 
-// Поиск сессии по DTLS соединению
+// Поиск сессии по DTLS соединению - ОТЛАДОЧНАЯ ВЕРСИЯ
 func (s *RelayServer) findSessionByDTLSConn(conn *dtls.Conn) *ClientSession {
 	s.sessionsMu.RLock()
 	defer s.sessionsMu.RUnlock()
 
 	remoteAddr := conn.RemoteAddr().String()
-	for _, session := range s.sessions {
+	s.log(fmt.Sprintf("🔍 Looking for session with remote address: %s", remoteAddr))
+	s.log(fmt.Sprintf("🔍 Available sessions: %d", len(s.sessions)))
+
+	for sessionID, session := range s.sessions {
+		s.log(fmt.Sprintf("   Session %x: %v", sessionID[:4], session.RemoteAddr))
 		if session.RemoteAddr != nil && session.RemoteAddr.String() == remoteAddr {
+			s.log(fmt.Sprintf("✅ Found matching session: %x", sessionID[:4]))
 			return session
 		}
 	}
+
+	s.log("❌ No matching session found")
 	return nil
 }
 
@@ -1159,16 +1359,16 @@ func max(a, b uint32) uint32 {
 	return b
 }
 
-// Логирование
+// Безопасный метод логирования для сервера
 func (s *RelayServer) log(message string) {
 	timestamp := time.Now().Format("15:04:05")
 	logMessage := fmt.Sprintf("[%s] %s", timestamp, message)
 
-	// Отправляем в канал для GUI
+	// Неблокирующая отправка в канал
 	select {
 	case s.logChan <- logMessage:
 	default:
-		// Канал переполнен, пропускаем
+		// Канал переполнен, пропускаем (избегаем блокировки)
 	}
 
 	// Также выводим в консоль
@@ -1176,6 +1376,7 @@ func (s *RelayServer) log(message string) {
 }
 
 // Создание GUI
+// Создание GUI - ИСПРАВЛЕННАЯ ВЕРСИЯ для сервера
 func (s *RelayServer) createGUI() fyne.Window {
 	myApp := app.New()
 	myWindow := myApp.NewWindow("VPN Relay Server")
@@ -1187,11 +1388,25 @@ func (s *RelayServer) createGUI() fyne.Window {
 
 	// Кнопки управления
 	startButton := widget.NewButton("Start Server", func() {
-		go s.startServer()
+		// Отключаем кнопку сразу в UI thread
+		startButton.Disable()
+
+		go func() {
+			defer func() {
+				// Включаем кнопку обратно через fyne.NewWithoutData
+				fyne.NewWithoutData(func() {
+					startButton.Enable()
+				}).Run()
+			}()
+
+			s.startServer()
+		}()
 	})
 
 	stopButton := widget.NewButton("Stop Server", func() {
-		s.stopServer()
+		go func() {
+			s.stopServer()
+		}()
 	})
 
 	// Список клиентов
@@ -1239,10 +1454,11 @@ func (s *RelayServer) createGUI() fyne.Window {
 	logScroll := container.NewScroll(s.logText)
 	logScroll.SetMinSize(fyne.NewSize(400, 200))
 
-	// Настройки
+	// Настройки DNS серверов
 	dnsServersEntry := widget.NewEntry()
 	dnsServersEntry.SetText(strings.Join(s.dnsServers, ", "))
 	dnsServersEntry.OnChanged = func(text string) {
+		// OnChanged уже вызывается в UI thread
 		servers := strings.Split(text, ",")
 		for i := range servers {
 			servers[i] = strings.TrimSpace(servers[i])
@@ -1250,8 +1466,79 @@ func (s *RelayServer) createGUI() fyne.Window {
 		s.dnsServers = servers
 	}
 
+	// Кнопки дополнительного управления
+	clearLogsButton := widget.NewButton("Clear Logs", func() {
+		fyne.NewWithoutData(func() {
+			s.logText.SetText("Server log cleared...\n")
+		}).Run()
+	})
+
+	showStatsButton := widget.NewButton("Show Detailed Stats", func() {
+		go func() {
+			s.sessionsMu.RLock()
+			activeClients := len(s.sessions)
+
+			var totalTCP, totalUDP int
+			var totalBytesIn, totalBytesOut uint64
+
+			for _, session := range s.sessions {
+				session.mu.RLock()
+				totalTCP += len(session.TCPConns)
+				totalUDP += len(session.UDPConns)
+				totalBytesIn += session.BytesIn
+				totalBytesOut += session.BytesOut
+				session.mu.RUnlock()
+			}
+			s.sessionsMu.RUnlock()
+
+			s.dnsCacheMu.RLock()
+			dnsEntries := len(s.dnsCache)
+			s.dnsCacheMu.RUnlock()
+
+			statsMessage := fmt.Sprintf(
+				"=== Detailed Server Statistics ===\n"+
+					"Active Clients: %d\n"+
+					"Total TCP Connections: %d\n"+
+					"Total UDP Connections: %d\n"+
+					"Total Traffic In: %.2f MB\n"+
+					"Total Traffic Out: %.2f MB\n"+
+					"DNS Cache Entries: %d\n"+
+					"Uptime: %v\n"+
+					"Total Connections Since Start: %d",
+				activeClients,
+				totalTCP,
+				totalUDP,
+				float64(totalBytesIn)/(1024*1024),
+				float64(totalBytesOut)/(1024*1024),
+				dnsEntries,
+				time.Since(s.startTime).Truncate(time.Second),
+				s.totalConnections,
+			)
+
+			s.log(statsMessage)
+		}()
+	})
+
+	clearCacheButton := widget.NewButton("Clear DNS Cache", func() {
+		go func() {
+			s.dnsCacheMu.Lock()
+			oldSize := len(s.dnsCache)
+			s.dnsCache = make(map[string]*DNSCacheEntry)
+			s.dnsCacheMu.Unlock()
+
+			s.log(fmt.Sprintf("DNS cache cleared (%d entries removed)", oldSize))
+		}()
+	})
+
 	// Компоновка
-	controlsContainer := container.NewHBox(startButton, stopButton)
+	controlsContainer := container.NewHBox(
+		startButton,
+		stopButton,
+		widget.NewSeparator(),
+		clearLogsButton,
+		showStatsButton,
+		clearCacheButton,
+	)
 
 	statsContainer := container.NewVBox(
 		s.statusLabel,
@@ -1260,8 +1547,11 @@ func (s *RelayServer) createGUI() fyne.Window {
 	)
 
 	settingsContainer := container.NewVBox(
-		widget.NewLabel("DNS Servers:"),
-		dnsServersEntry,
+		widget.NewLabel("Configuration:"),
+		widget.NewForm(
+			widget.NewFormItem("DNS Servers", dnsServersEntry),
+		),
+		widget.NewLabel("Separate multiple DNS servers with commas"),
 		widget.NewSeparator(),
 	)
 
@@ -1275,7 +1565,18 @@ func (s *RelayServer) createGUI() fyne.Window {
 		logScroll,
 	)
 
+	// Информационная панель
+	infoContainer := container.NewVBox(
+		widget.NewLabel("VPN Relay Server Information:"),
+		widget.NewLabel("• Listens on multicast 224.0.0.251:8888 for discovery"),
+		widget.NewLabel("• DTLS server runs on port 8889"),
+		widget.NewLabel("• Supports HTTP, TCP, UDP tunneling and DNS resolution"),
+		widget.NewLabel("• Uses ECDH + PSK for secure client authentication"),
+		widget.NewSeparator(),
+	)
+
 	leftPanel := container.NewVBox(
+		infoContainer,
 		statsContainer,
 		settingsContainer,
 		controlsContainer,
@@ -1287,13 +1588,19 @@ func (s *RelayServer) createGUI() fyne.Window {
 
 	myWindow.SetContent(content)
 
-	// Запускаем горутину обновления GUI
+	// ВАЖНО: Запускаем горутину обновления GUI
 	go s.updateGUI()
+
+	// Обработчик закрытия окна
+	myWindow.SetCloseIntercept(func() {
+		s.stopServer()
+		myWindow.Close()
+	})
 
 	return myWindow
 }
 
-// Обновление GUI
+// Исправленный updateGUI для сервера
 func (s *RelayServer) updateGUI() {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
@@ -1303,31 +1610,40 @@ func (s *RelayServer) updateGUI() {
 		case <-s.stopChan:
 			return
 		case logMessage := <-s.logChan:
+			// ИСПРАВЛЕНИЕ: Обновление GUI через fyne.NewWithoutData
 			if s.logText != nil {
-				currentText := s.logText.Text
-				newText := currentText + logMessage + "\n"
+				fyne.NewWithoutData(func() {
+					currentText := s.logText.Text
+					newText := currentText + logMessage + "\n"
 
-				// Ограничиваем размер лога
-				lines := strings.Split(newText, "\n")
-				if len(lines) > 1000 {
-					lines = lines[len(lines)-1000:]
-					newText = strings.Join(lines, "\n")
-				}
+					// Ограничиваем размер лога
+					lines := strings.Split(newText, "\n")
+					if len(lines) > 1000 {
+						lines = lines[len(lines)-1000:]
+						newText = strings.Join(lines, "\n")
+					}
 
-				s.logText.SetText(newText)
-				s.logText.CursorRow = len(lines) - 1
+					s.logText.SetText(newText)
+					s.logText.CursorRow = len(lines) - 1
+				}).Run()
 			}
 		case <-ticker.C:
+			// ИСПРАВЛЕНИЕ: Обновление статуса через fyne.NewWithoutData
 			if s.statusLabel != nil {
-				s.updateStats()
-				s.clientsList.Refresh()
+				fyne.NewWithoutData(func() {
+					s.updateStats()
+					if s.clientsList != nil {
+						s.clientsList.Refresh()
+					}
+				}).Run()
 			}
 		}
 	}
 }
 
-// Обновление статистики
+// Исправленный updateStats для сервера
 func (s *RelayServer) updateStats() {
+	// Эта функция теперь вызывается ТОЛЬКО из UI thread через fyne.NewWithoutData
 	s.sessionsMu.RLock()
 	activeClients := len(s.sessions)
 
