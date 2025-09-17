@@ -39,23 +39,90 @@ type incomingMessage struct {
 	err        error
 }
 
+type udpConnWrapper struct {
+	conn   *net.UDPConn
+	remote *net.UDPAddr
+}
+
+func newUDPConnWrapper(conn *net.UDPConn, remote *net.UDPAddr) *udpConnWrapper {
+	return &udpConnWrapper{conn: conn, remote: remote}
+}
+
+func (u *udpConnWrapper) Read(b []byte) (int, error) {
+	for {
+		n, addr, err := u.conn.ReadFromUDP(b)
+		if err != nil {
+			return 0, err
+		}
+		if addr == nil || udpAddrEqual(addr, u.remote) {
+			return n, nil
+		}
+	}
+}
+
+func (u *udpConnWrapper) Write(b []byte) (int, error) {
+	n, err := u.conn.WriteToUDP(b, u.remote)
+	return n, err
+}
+
+func (u *udpConnWrapper) Close() error {
+	return u.conn.Close()
+}
+
+func (u *udpConnWrapper) LocalAddr() net.Addr {
+	return u.conn.LocalAddr()
+}
+
+func (u *udpConnWrapper) RemoteAddr() net.Addr {
+	return u.remote
+}
+
+func (u *udpConnWrapper) SetDeadline(t time.Time) error {
+	return u.conn.SetDeadline(t)
+}
+
+func (u *udpConnWrapper) SetReadDeadline(t time.Time) error {
+	return u.conn.SetReadDeadline(t)
+}
+
+func (u *udpConnWrapper) SetWriteDeadline(t time.Time) error {
+	return u.conn.SetWriteDeadline(t)
+}
+
+func udpAddrEqual(a, b *net.UDPAddr) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	if !a.IP.Equal(b.IP) {
+		return false
+	}
+	if a.Port != b.Port {
+		return false
+	}
+	if a.Zone != b.Zone {
+		return false
+	}
+	return true
+}
+
 // Client implements a production-grade client for the VPN relay server.
 type Client struct {
 	cfg    Config
 	logger *logWrapper
 
-	mu          sync.RWMutex
-	privateKey  *ecdh.PrivateKey
-	clientID    [16]byte
-	sessionID   [16]byte
-	sharedKey   []byte
-	serverAddr  *net.UDPAddr
-	dtlsConn    *dtls.Conn
-	readCancel  context.CancelFunc
-	readDone    chan struct{}
-	closed      bool
-	nextRequest uint32
-	nextConnID  uint32
+	mu            sync.RWMutex
+	privateKey    *ecdh.PrivateKey
+	clientID      [16]byte
+	sessionID     [16]byte
+	sharedKey     []byte
+	serverAddr    *net.UDPAddr
+	discoveryConn *net.UDPConn
+	dtlsConn      *dtls.Conn
+	readCancel    context.CancelFunc
+	readDone      chan struct{}
+	closed        bool
+	nextRequest   uint32
+	nextConnID    uint32
 
 	pendingMu sync.Mutex
 	pending   map[uint32]*pendingRequest
@@ -111,7 +178,12 @@ func (c *Client) Discover(ctx context.Context) (*Handshake, error) {
 	if err != nil {
 		return nil, fmt.Errorf("listen udp: %w", err)
 	}
-	defer conn.Close()
+	keepConn := false
+	defer func() {
+		if !keepConn {
+			conn.Close()
+		}
+	}()
 
 	pubBytes := privateKey.PublicKey().Bytes()
 	if len(pubBytes) != 65 || pubBytes[0] != 0x04 {
@@ -168,9 +240,17 @@ func (c *Client) Discover(ctx context.Context) (*Handshake, error) {
 	hasher.Write([]byte(c.cfg.SharedSecret))
 	combined := hasher.Sum(nil)
 
+	if err := conn.SetReadDeadline(time.Time{}); err != nil {
+		return nil, fmt.Errorf("clear discovery read deadline: %w", err)
+	}
+	if err := conn.SetWriteDeadline(time.Time{}); err != nil {
+		return nil, fmt.Errorf("clear discovery write deadline: %w", err)
+	}
+
 	remoteAddr := &net.UDPAddr{IP: addr.IP, Port: int(response.DTLSPort)}
 
 	c.mu.Lock()
+	prevConn := c.discoveryConn
 	c.privateKey = privateKey
 	c.clientID = clientID
 	c.sessionID = response.SessionID
@@ -178,6 +258,12 @@ func (c *Client) Discover(ctx context.Context) (*Handshake, error) {
 	c.serverAddr = remoteAddr
 	c.closed = false
 	c.mu.Unlock()
+
+	if prevConn != nil && prevConn != conn {
+		prevConn.Close()
+	}
+
+	keepConn = true
 
 	c.logger.Infof("discovery complete: session=%x remote=%s", response.SessionID[:4], remoteAddr)
 
@@ -206,9 +292,10 @@ func (c *Client) Connect(ctx context.Context) error {
 		return errors.New("DTLS connection already established")
 	}
 	remoteAddr := c.serverAddr
+	discoveryConn := c.discoveryConn
 	c.mu.RUnlock()
 
-	if remoteAddr == nil {
+	if remoteAddr == nil || discoveryConn == nil {
 		return errors.New("discovery has not been performed")
 	}
 
@@ -223,16 +310,47 @@ func (c *Client) Connect(ctx context.Context) error {
 		CipherSuites:    []dtls.CipherSuiteID{dtls.TLS_PSK_WITH_AES_128_GCM_SHA256},
 	}
 
-	conn, err := dtls.DialWithContext(dialCtx, "udp", remoteAddr, cfg)
+	cleanupDiscovery := func() {
+		if discoveryConn == nil {
+			return
+		}
+		discoveryConn.Close()
+		c.mu.Lock()
+		if c.discoveryConn == discoveryConn {
+			c.discoveryConn = nil
+		}
+		c.mu.Unlock()
+	}
+
+	if err := discoveryConn.SetReadDeadline(time.Time{}); err != nil {
+		cleanupDiscovery()
+		return fmt.Errorf("prepare discovery socket: %w", err)
+	}
+	if err := discoveryConn.SetWriteDeadline(time.Time{}); err != nil {
+		cleanupDiscovery()
+		return fmt.Errorf("prepare discovery socket: %w", err)
+	}
+
+	wrappedConn := newUDPConnWrapper(discoveryConn, remoteAddr)
+
+	conn, err := dtls.ClientWithContext(dialCtx, wrappedConn, cfg)
 	if err != nil {
-		return fmt.Errorf("dtls dial: %w", err)
+		cleanupDiscovery()
+		return fmt.Errorf("dtls handshake: %w", err)
 	}
 
 	c.mu.Lock()
 	if c.closed {
+		if c.discoveryConn == discoveryConn {
+			c.discoveryConn = nil
+		}
 		c.mu.Unlock()
 		conn.Close()
+		cleanupDiscovery()
 		return errors.New("client is closed")
+	}
+	if c.discoveryConn == discoveryConn {
+		c.discoveryConn = nil
 	}
 	c.dtlsConn = conn
 	readCtx, cancelRead := context.WithCancel(context.Background())
@@ -260,6 +378,8 @@ func (c *Client) Close() error {
 	c.readCancel = nil
 	done := c.readDone
 	c.readDone = nil
+	discConn := c.discoveryConn
+	c.discoveryConn = nil
 	c.mu.Unlock()
 
 	if cancel != nil {
@@ -267,6 +387,9 @@ func (c *Client) Close() error {
 	}
 	if conn != nil {
 		conn.Close()
+	}
+	if discConn != nil {
+		discConn.Close()
 	}
 	if done != nil {
 		<-done
